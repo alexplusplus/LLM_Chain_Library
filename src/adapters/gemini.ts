@@ -1,0 +1,111 @@
+import { GoogleGenAI } from "@google/genai";
+import {
+  InvalidRequestError,
+  LlmChainError,
+  QuotaError,
+  TransientError,
+} from "../errors.js";
+import { toGeminiSchema } from "../schema/dialects.js";
+import type { AdapterRequest, ProviderAdapter } from "../types.js";
+
+/**
+ * Structural slice of the `@google/genai` client the adapter actually uses.
+ * Tests inject a fake matching this shape (mocked-SDK seam).
+ */
+export interface GeminiClientLike {
+  models: {
+    generateContent(params: {
+      model: string;
+      contents: string;
+      config: {
+        responseMimeType: string;
+        responseSchema: Record<string, unknown>;
+      };
+    }): Promise<{ text?: string | undefined }>;
+  };
+}
+
+export interface GeminiAdapterOptions {
+  apiKey?: string;
+  /** Injectable for tests; defaults to a real `GoogleGenAI` client. */
+  client?: GeminiClientLike;
+}
+
+/**
+ * Adapter for the Gemini API (`@google/genai` SDK), using native
+ * `responseSchema` JSON enforcement.
+ */
+export class GeminiAdapter implements ProviderAdapter {
+  readonly providerId = "gemini";
+  private readonly client: GeminiClientLike;
+
+  constructor(options: GeminiAdapterOptions = {}) {
+    this.client =
+      options.client ??
+      new GoogleGenAI(options.apiKey !== undefined ? { apiKey: options.apiKey } : {});
+  }
+
+  async generate(request: AdapterRequest): Promise<string> {
+    let response: { text?: string | undefined };
+    try {
+      response = await this.client.models.generateContent({
+        model: request.modelId,
+        contents: request.prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: toGeminiSchema(request.schema),
+        },
+      });
+    } catch (error) {
+      throw classifyGeminiError(error);
+    }
+    const text = response.text;
+    if (text === undefined || text === "") {
+      throw new TransientError("Gemini returned an empty response");
+    }
+    return text;
+  }
+}
+
+function classifyGeminiError(error: unknown): LlmChainError {
+  if (error instanceof LlmChainError) return error;
+
+  const status = statusOf(error);
+  const message = messageOf(error);
+
+  if (status === 429) {
+    return new QuotaError(`Gemini quota exhausted: ${message}`, {
+      ...(parseRetryDelay(message) ?? {}),
+      cause: error,
+    });
+  }
+  if (status !== undefined && status >= 400 && status < 500 && status !== 408) {
+    return new InvalidRequestError(`Gemini rejected the request (${status}): ${message}`, {
+      cause: error,
+    });
+  }
+  // 5xx, 408, or no HTTP status at all (network/timeout).
+  return new TransientError(`Gemini request failed: ${message}`, { cause: error });
+}
+
+/**
+ * Gemini 429 bodies embed a RetryInfo detail like `"retryDelay":"39s"`;
+ * surface it as an absolute retry time so the chain can size the Cooldown.
+ */
+function parseRetryDelay(message: string): { retryAt: Date } | undefined {
+  const match = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(message);
+  if (!match?.[1]) return undefined;
+  return { retryAt: new Date(Date.now() + Number(match[1]) * 1000) };
+}
+
+function statusOf(error: unknown): number | undefined {
+  if (typeof error === "object" && error !== null) {
+    const status = (error as { status?: unknown }).status;
+    if (typeof status === "number") return status;
+  }
+  return undefined;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

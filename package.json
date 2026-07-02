@@ -1,0 +1,55 @@
+{
+  "name": "llm-fallback-chain",
+  "version": "0.1.0",
+  "description": "Structured LLM output through a configurable provider fallback chain: free tiers first, paid floor last, with pluggable cooldown storage.",
+  "keywords": [
+    "llm",
+    "fallback",
+    "structured-output",
+    "zod",
+    "gemini",
+    "openai",
+    "openrouter",
+    "json-schema"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@google/genai": "^2.10.0",
+    "openai": "^6.45.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9",
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "zod": "^4.0.0"
+  }
+}
