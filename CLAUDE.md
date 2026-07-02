@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`llm-fallback-chain` — a standalone, open-source npm library implementing an LLM provider fallback chain with structured (zod-schema) output. It is Phase 1 of a larger migration; the consuming app lives in a **separate repo** and is out of scope here. Domain vocabulary (Provider, Chain Entry, Cooldown, Exhaustion, etc.) is defined in `CONTEXT.md` — use those terms with exactly those meanings.
+`@alexplusplus/llm-fallback-chain` (the unscoped name was taken on npm) — a standalone, open-source npm library implementing an LLM provider fallback chain with structured (zod-schema) output. It is Phase 1 of a larger migration; the consuming app lives in a **separate repo** and is out of scope here. Domain vocabulary (Provider, Chain Entry, Cooldown, Exhaustion, etc.) is defined in `CONTEXT.md` — use those terms with exactly those meanings.
 
 ## Commands
 

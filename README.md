@@ -1,4 +1,4 @@
-# llm-fallback-chain
+# @alexplusplus/llm-fallback-chain
 
 Structured LLM output through a configurable provider **fallback chain**:
 free tiers first, a paid floor last, with pluggable cooldown storage.
@@ -19,7 +19,7 @@ Gemini (free) ──quota──▶ OpenRouter (cheap) ──5xx──▶ OpenAI 
 ## Install
 
 ```sh
-npm install llm-fallback-chain zod
+npm install @alexplusplus/llm-fallback-chain zod
 ```
 
 `zod` (v4) is a peer dependency.
@@ -33,7 +33,7 @@ import {
   GeminiAdapter,
   OpenAiAdapter,
   OpenRouterAdapter,
-} from "llm-fallback-chain";
+} from "@alexplusplus/llm-fallback-chain";
 
 const chain = createFallbackChain({
   entries: [
@@ -131,7 +131,7 @@ Verify any implementation against the behavioral contract (framework-agnostic,
 works in any test runner):
 
 ```ts
-import { verifyCooldownStoreContract } from "llm-fallback-chain";
+import { verifyCooldownStoreContract } from "@alexplusplus/llm-fallback-chain";
 
 await verifyCooldownStoreContract(() => new MyFirestoreCooldownStore(db));
 ```
@@ -145,7 +145,7 @@ import {
   type ProviderAdapter, type AdapterRequest,
   toStrictJsonSchema, // or toGeminiSchema / toJsonSchemaResponseFormat
   QuotaError, TransientError, InvalidRequestError,
-} from "llm-fallback-chain";
+} from "@alexplusplus/llm-fallback-chain";
 
 class MyAdapter implements ProviderAdapter {
   readonly providerId = "my-provider";

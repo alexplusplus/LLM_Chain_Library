@@ -1,5 +1,5 @@
 {
-  "name": "llm-fallback-chain",
+  "name": "@alexplusplus/llm-fallback-chain",
   "version": "0.1.0",
   "description": "Structured LLM output through a configurable provider fallback chain: free tiers first, paid floor last, with pluggable cooldown storage.",
   "keywords": [
