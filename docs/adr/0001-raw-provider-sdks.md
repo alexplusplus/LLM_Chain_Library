@@ -30,5 +30,3 @@ or plain HTTP (OpenRouter). The Vercel AI SDK is not used.
 - No dependency on a third party's release cadence or breaking changes for
   the library's core behavior.
 
-<!-- TODO(author): add a sentence on the personal motivation for rejecting
-     the Vercel AI SDK before the repo goes public (noted in the PRD). -->
