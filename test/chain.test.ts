@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import { z } from "zod";
 import {
   ChainExhaustedError,
@@ -7,9 +7,14 @@ import {
   InvalidRequestError,
   nextUtcMidnight,
   QuotaError,
+  REASONING_EFFORTS,
   TransientError,
   type AdapterRequest,
+  type EntryFailure,
+  type ChainEntry,
+  type PlainGenerateRequest,
   type ProviderAdapter,
+  type ReasoningEffort,
 } from "../src/index.js";
 
 const schema = z.object({ text: z.string() });
@@ -296,5 +301,160 @@ describe("createFallbackChain", () => {
       kind: "object",
       properties: { text: { kind: "string" } },
     });
+  });
+
+  it("sends no schema, schemaName, or reasoningEffort keys to the adapter when all are omitted (v0.1.1 parity)", async () => {
+    const first = fakeAdapter("gemini", async () => "plain answer");
+    const chain = createFallbackChain({
+      entries: [{ key: "free", adapter: first, modelId: "m1" }],
+    });
+
+    await chain.generate({ prompt: "p" });
+
+    expect(first.calls[0]).toEqual({ modelId: "m1", prompt: "p" });
+  });
+});
+
+describe("plain-text mode", () => {
+  it("returns exactly { text, entry, failures } — no raw, no data", async () => {
+    const first = fakeAdapter("gemini", async () => "  free-form\ntext ");
+    const chain = createFallbackChain({
+      entries: [{ key: "free", adapter: first, modelId: "m1" }],
+    });
+
+    const result = await chain.generate({ prompt: "p" });
+
+    expect(result).toEqual({
+      text: "  free-form\ntext ", // verbatim: surrounding whitespace preserved
+      entry: { key: "free", providerId: "gemini", modelId: "m1" },
+      failures: [],
+    });
+  });
+
+  it("records whitespace-only output as invalid-output with a short cooldown and falls through", async () => {
+    const first = fakeAdapter("gemini", async () => " \n\t ");
+    const second = fakeAdapter("openai", async () => "recovered");
+    const store = new InMemoryCooldownStore({ now: fixedNow });
+    const chain = createFallbackChain({
+      entries: [
+        { key: "free", adapter: first, modelId: "m1" },
+        { key: "paid", adapter: second, modelId: "m2" },
+      ],
+      cooldownStore: store,
+      transientCooldownMs: 30_000,
+      now: fixedNow,
+    });
+
+    const result = await chain.generate({ prompt: "p" });
+
+    expect(result.text).toBe("recovered");
+    expect(result.failures[0]).toMatchObject({ entryKey: "free", reason: "invalid-output" });
+    expect(await store.check("free")).toEqual(new Date(NOW.getTime() + 30_000));
+  });
+
+  it("walks the full fallback machinery: quota cooldown, fallthrough, exhaustion aggregation", async () => {
+    const first = failingWith("gemini", new QuotaError("gone"));
+    const second = failingWith("openai", new TransientError("down"));
+    const chain = createFallbackChain({
+      entries: [
+        { key: "free", adapter: first, modelId: "m1" },
+        { key: "paid", adapter: second, modelId: "m2" },
+      ],
+      now: fixedNow,
+    });
+
+    const error = await chain.generate({ prompt: "p" }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ChainExhaustedError);
+    expect((error as ChainExhaustedError).failures.map((f) => [f.entryKey, f.reason])).toEqual([
+      ["free", "quota"],
+      ["paid", "transient"],
+    ]);
+  });
+
+  it("shares cooldowns across modes: a structured-mode quota cooldown skips the entry in plain mode", async () => {
+    const first = failingWith("gemini", new QuotaError("gone"));
+    const second = fakeAdapter("openai", async () => goodJson);
+    const chain = createFallbackChain({
+      entries: [
+        { key: "free", adapter: first, modelId: "m1" },
+        { key: "paid", adapter: second, modelId: "m2" },
+      ],
+      cooldownStore: new InMemoryCooldownStore({ now: fixedNow }),
+      now: fixedNow,
+    });
+
+    await chain.generate({ prompt: "p", schema });
+    const result = await chain.generate({ prompt: "p" });
+
+    expect(first.calls).toHaveLength(1); // skipped in the plain call
+    expect(result.failures[0]).toMatchObject({ entryKey: "free", reason: "cooldown" });
+    expect(result.text).toBe(goodJson);
+  });
+});
+
+describe("reasoningEffort", () => {
+  it("forwards the effort to the adapter in both modes", async () => {
+    const adapter = fakeAdapter("gemini", async () => goodJson);
+    const chain = createFallbackChain({
+      entries: [{ key: "free", adapter, modelId: "m1" }],
+    });
+
+    await chain.generate({ prompt: "p", schema, reasoningEffort: "low" });
+    await chain.generate({ prompt: "p", reasoningEffort: "xhigh" });
+
+    expect(adapter.calls[0]?.reasoningEffort).toBe("low");
+    expect(adapter.calls[1]?.reasoningEffort).toBe("xhigh");
+  });
+
+  it("rejects an effort value outside the dictionary before calling any adapter", async () => {
+    const adapter = fakeAdapter("gemini", async () => goodJson);
+    const chain = createFallbackChain({
+      entries: [{ key: "free", adapter, modelId: "m1" }],
+    });
+
+    await expect(
+      chain.generate({ prompt: "p", reasoningEffort: "ultra" as ReasoningEffort }),
+    ).rejects.toBeInstanceOf(InvalidRequestError);
+    expect(adapter.calls).toHaveLength(0);
+  });
+
+  it("rejects schemaName without schema before calling any adapter", async () => {
+    const adapter = fakeAdapter("gemini", async () => goodJson);
+    const chain = createFallbackChain({
+      entries: [{ key: "free", adapter, modelId: "m1" }],
+    });
+    // Untyped-caller shape: the typed API already forbids this.
+    const request = { prompt: "p", schemaName: "orphan" } as unknown as PlainGenerateRequest;
+
+    await expect(chain.generate(request)).rejects.toBeInstanceOf(InvalidRequestError);
+    expect(adapter.calls).toHaveLength(0);
+  });
+
+  it("exports the runtime dictionary in order", () => {
+    expect(REASONING_EFFORTS).toEqual(["minimal", "low", "medium", "high", "xhigh"]);
+  });
+});
+
+describe("generate() result types (compile-time)", () => {
+  it("infers typed data for structured calls and text for plain calls", async () => {
+    const adapter = fakeAdapter("gemini", async () => goodJson);
+    const chain = createFallbackChain({
+      entries: [{ key: "free", adapter, modelId: "m1" }],
+    });
+
+    const structured = await chain.generate({ prompt: "p", schema });
+    expectTypeOf(structured.data).toEqualTypeOf<{ text: string }>();
+    expectTypeOf(structured.raw).toEqualTypeOf<string>();
+    expectTypeOf(structured.entry).toEqualTypeOf<ChainEntry>();
+    expectTypeOf(structured.failures).toEqualTypeOf<readonly EntryFailure[]>();
+
+    const plain = await chain.generate({ prompt: "p" });
+    expectTypeOf(plain.text).toEqualTypeOf<string>();
+    expectTypeOf(plain.entry).toEqualTypeOf<ChainEntry>();
+    expectTypeOf(plain.failures).toEqualTypeOf<readonly EntryFailure[]>();
+    // Plain results carry neither `data` nor `raw`.
+    expectTypeOf(plain).not.toHaveProperty("data");
+    expectTypeOf(plain).not.toHaveProperty("raw");
   });
 });

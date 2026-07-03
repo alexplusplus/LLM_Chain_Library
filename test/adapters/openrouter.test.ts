@@ -61,6 +61,66 @@ describe("OpenRouterAdapter", () => {
     });
   });
 
+  it("sends no reasoning field at all when reasoningEffort is omitted (v0.1.1 parity)", async () => {
+    let call: CapturedCall | undefined;
+    const adapter = new OpenRouterAdapter({
+      apiKey: "k",
+      fetch: fetchReturning(success, {}, (c) => (call = c)),
+    });
+
+    await adapter.generate(request);
+
+    const payload = JSON.parse(String(call?.init.body)) as Record<string, unknown>;
+    expect(Object.keys(payload)).toEqual(["model", "messages", "response_format"]);
+  });
+
+  it("omits response_format entirely in plain-text mode and returns the text verbatim", async () => {
+    let call: CapturedCall | undefined;
+    const adapter = new OpenRouterAdapter({
+      apiKey: "k",
+      fetch: fetchReturning(
+        { choices: [{ message: { content: "  free-form\n" } }] },
+        {},
+        (c) => (call = c),
+      ),
+    });
+
+    const raw = await adapter.generate({ modelId: "some/model:free", prompt: "generate" });
+
+    expect(raw).toBe("  free-form\n");
+    const payload = JSON.parse(String(call?.init.body)) as Record<string, unknown>;
+    expect(Object.keys(payload)).toEqual(["model", "messages"]);
+  });
+
+  it("treats an empty plain-text completion as TransientError", async () => {
+    const adapter = new OpenRouterAdapter({
+      apiKey: "k",
+      fetch: fetchReturning({ choices: [{ message: { content: "" } }] }),
+    });
+    await expect(
+      adapter.generate({ modelId: "some/model:free", prompt: "generate" }),
+    ).rejects.toBeInstanceOf(TransientError);
+  });
+
+  it.each([
+    ["minimal", "minimal"],
+    ["low", "low"],
+    ["medium", "medium"],
+    ["high", "high"],
+    ["xhigh", "xhigh"],
+  ] as const)("passes reasoningEffort %s through natively as reasoning.effort", async (effort, expected) => {
+    let call: CapturedCall | undefined;
+    const adapter = new OpenRouterAdapter({
+      apiKey: "k",
+      fetch: fetchReturning(success, {}, (c) => (call = c)),
+    });
+
+    await adapter.generate({ ...request, reasoningEffort: effort });
+
+    const payload = JSON.parse(String(call?.init.body)) as Record<string, unknown>;
+    expect(payload.reasoning).toEqual({ effort: expected });
+  });
+
   it("classifies 429 as QuotaError and reads X-RateLimit-Reset (epoch ms)", async () => {
     const resetAt = Date.now() + 90_000;
     const adapter = new OpenRouterAdapter({

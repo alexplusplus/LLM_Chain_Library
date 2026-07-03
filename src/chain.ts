@@ -7,6 +7,7 @@ import {
   type EntryFailure,
 } from "./errors.js";
 import { InMemoryCooldownStore } from "./cooldown/in-memory.js";
+import { REASONING_EFFORTS, type ReasoningEffort } from "./effort.js";
 import { zodToPortable } from "./schema/portable.js";
 import { nextUtcMidnight } from "./time.js";
 import type { ChainEntry, CooldownStore, ProviderAdapter } from "./types.js";
@@ -41,6 +42,19 @@ export interface GenerateRequest<S extends z.ZodType> {
   schema: S;
   /** Name passed to dialects that require one (OpenAI/OpenRouter). Default: "response". */
   schemaName?: string;
+  /** Optional unified reasoning effort; each adapter converts it to its provider's dialect. */
+  reasoningEffort?: ReasoningEffort;
+}
+
+/** Request for plain-text mode. Presence of `schema` is what selects the mode. */
+export interface PlainGenerateRequest {
+  prompt: string;
+  /** Must stay absent — a schema selects structured mode. */
+  schema?: undefined;
+  /** Only meaningful alongside `schema`; passing it alone is an `InvalidRequestError`. */
+  schemaName?: undefined;
+  /** Optional unified reasoning effort; each adapter converts it to its provider's dialect. */
+  reasoningEffort?: ReasoningEffort;
 }
 
 export interface GenerateResult<T> {
@@ -54,10 +68,22 @@ export interface GenerateResult<T> {
   failures: readonly EntryFailure[];
 }
 
+export interface PlainGenerateResult {
+  /** The provider's response text, verbatim (not trimmed). */
+  text: string;
+  /** Which Chain Entry served the request — log this to watch cost drift. */
+  entry: ChainEntry;
+  /** Entries that were skipped or failed before `entry` served the request. */
+  failures: readonly EntryFailure[];
+}
+
 export interface FallbackChain {
+  /** Structured mode: the response is JSON-parsed and validated against `schema`. */
   generate<S extends z.ZodType>(
     request: GenerateRequest<S>,
   ): Promise<GenerateResult<z.output<S>>>;
+  /** Plain-text mode: no schema, the response text is returned verbatim. */
+  generate(request: PlainGenerateRequest): Promise<PlainGenerateResult>;
 }
 
 const DEFAULT_TRANSIENT_COOLDOWN_MS = 60_000;
@@ -70,6 +96,10 @@ const DEFAULT_TRANSIENT_COOLDOWN_MS = 60_000;
  * - transient error / invalid model output → short Cooldown → fall through
  * - invalid request → the whole call fails immediately, nothing is cooled down
  * - all entries skipped/failed → {@link ChainExhaustedError}
+ *
+ * Passing a `schema` selects structured mode; omitting it selects plain-text
+ * mode. Both modes share the same walk — Cooldowns are per entry key and
+ * mode-independent (they represent provider/model quota state).
  */
 export function createFallbackChain(config: FallbackChainConfig): FallbackChain {
   if (config.entries.length === 0) {
@@ -96,79 +126,121 @@ export function createFallbackChain(config: FallbackChainConfig): FallbackChain 
   const quotaFallback = config.quotaRetryFallback ?? nextUtcMidnight;
   const now = config.now ?? (() => new Date());
 
-  return {
-    async generate(request) {
-      // Compile the schema once, before touching any provider. An
-      // out-of-subset schema fails the whole call here — the loud path.
-      const portable = zodToPortable(request.schema);
-      const schemaName = request.schemaName ?? "response";
-      const failures: EntryFailure[] = [];
+  async function generate(
+    request: GenerateRequest<z.ZodType> | PlainGenerateRequest,
+  ): Promise<GenerateResult<unknown> | PlainGenerateResult> {
+    // Fail-fast validation — before schema compilation, before any provider
+    // call. Catches untyped callers (config strings, plain JS).
+    const effort = request.reasoningEffort;
+    if (effort !== undefined && !(REASONING_EFFORTS as readonly string[]).includes(effort)) {
+      throw new InvalidRequestError(
+        `Unknown reasoningEffort "${String(effort)}" — expected one of: ${REASONING_EFFORTS.join(", ")}`,
+      );
+    }
+    if (request.schema === undefined && request.schemaName !== undefined) {
+      throw new InvalidRequestError(
+        "schemaName was passed without a schema — pass both for structured mode, neither for plain text",
+      );
+    }
 
-      for (const { config: entry, meta } of entries) {
-        const fail = (
-          reason: EntryFailure["reason"],
-          message: string,
-          retryAt?: Date,
-        ): void => {
-          failures.push({
-            entryKey: meta.key,
-            providerId: meta.providerId,
-            modelId: meta.modelId,
-            reason,
-            message,
-            ...(retryAt ? { retryAt } : {}),
-          });
-        };
-
-        const cooledUntil = await store.check(entry.key);
-        if (cooledUntil !== null && cooledUntil.getTime() > now().getTime()) {
-          fail("cooldown", `On cooldown until ${cooledUntil.toISOString()}`, cooledUntil);
-          continue;
-        }
-
-        let raw: string;
-        try {
-          raw = await entry.adapter.generate({
-            modelId: entry.modelId,
-            prompt: request.prompt,
-            schema: portable,
-            schemaName,
-          });
-        } catch (error) {
-          if (error instanceof QuotaError) {
-            const retryAt = error.retryAt ?? quotaFallback(now());
-            await store.mark(entry.key, retryAt);
-            fail("quota", error.message, retryAt);
-            continue;
+    // Compile the schema once, before touching any provider. An
+    // out-of-subset schema fails the whole call here — the loud path.
+    // Plain-text mode has nothing to compile or validate.
+    const structured =
+      request.schema !== undefined
+        ? {
+            schema: request.schema,
+            portable: zodToPortable(request.schema),
+            schemaName: request.schemaName ?? "response",
           }
-          if (error instanceof TransientError) {
-            const retryAt = new Date(now().getTime() + transientMs);
-            await store.mark(entry.key, retryAt);
-            fail("transient", error.message, retryAt);
-            continue;
-          }
-          // InvalidRequestError — and anything unclassified, which is a bug —
-          // fails the entire call. No Cooldown anywhere: the same request
-          // would fail identically on every entry.
-          throw error;
-        }
+        : undefined;
 
-        const parsed = parseAndValidate(request.schema, raw);
-        if (!parsed.ok) {
-          // Native schema enforcement should make this rare; when it happens
-          // it's model flakiness, so treat it like a transient failure.
-          const retryAt = new Date(now().getTime() + transientMs);
-          await store.mark(entry.key, retryAt);
-          fail("invalid-output", parsed.message, retryAt);
-          continue;
-        }
+    const failures: EntryFailure[] = [];
 
-        return { data: parsed.data, entry: meta, raw, failures };
+    for (const { config: entry, meta } of entries) {
+      const fail = (
+        reason: EntryFailure["reason"],
+        message: string,
+        retryAt?: Date,
+      ): void => {
+        failures.push({
+          entryKey: meta.key,
+          providerId: meta.providerId,
+          modelId: meta.modelId,
+          reason,
+          message,
+          ...(retryAt ? { retryAt } : {}),
+        });
+      };
+
+      const cooledUntil = await store.check(entry.key);
+      if (cooledUntil !== null && cooledUntil.getTime() > now().getTime()) {
+        fail("cooldown", `On cooldown until ${cooledUntil.toISOString()}`, cooledUntil);
+        continue;
       }
 
-      throw new ChainExhaustedError(failures);
-    },
-  };
+      let raw: string;
+      try {
+        raw = await entry.adapter.generate({
+          modelId: entry.modelId,
+          prompt: request.prompt,
+          ...(structured
+            ? { schema: structured.portable, schemaName: structured.schemaName }
+            : {}),
+          ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+        });
+      } catch (error) {
+        if (error instanceof QuotaError) {
+          const retryAt = error.retryAt ?? quotaFallback(now());
+          await store.mark(entry.key, retryAt);
+          fail("quota", error.message, retryAt);
+          continue;
+        }
+        if (error instanceof TransientError) {
+          const retryAt = new Date(now().getTime() + transientMs);
+          await store.mark(entry.key, retryAt);
+          fail("transient", error.message, retryAt);
+          continue;
+        }
+        // InvalidRequestError — and anything unclassified, which is a bug —
+        // fails the entire call. No Cooldown anywhere: the same request
+        // would fail identically on every entry.
+        throw error;
+      }
+
+      if (structured === undefined) {
+        if (raw.trim() === "") {
+          // Whitespace-only output is the plain-mode analogue of failing
+          // schema validation: model flakiness, short Cooldown, fall through.
+          // (Truly-empty responses never get here — adapters throw
+          // TransientError on those.)
+          const retryAt = new Date(now().getTime() + transientMs);
+          await store.mark(entry.key, retryAt);
+          fail("invalid-output", "Response contains only whitespace", retryAt);
+          continue;
+        }
+        return { text: raw, entry: meta, failures };
+      }
+
+      const parsed = parseAndValidate(structured.schema, raw);
+      if (!parsed.ok) {
+        // Native schema enforcement should make this rare; when it happens
+        // it's model flakiness, so treat it like a transient failure.
+        const retryAt = new Date(now().getTime() + transientMs);
+        await store.mark(entry.key, retryAt);
+        fail("invalid-output", parsed.message, retryAt);
+        continue;
+      }
+
+      return { data: parsed.data, entry: meta, raw, failures };
+    }
+
+    throw new ChainExhaustedError(failures);
+  }
+
+  // The union-typed implementation serves both overloads; the cast is the
+  // standard TS pattern for implementing an overloaded interface method.
+  return { generate: generate as FallbackChain["generate"] };
 }
 
 function parseAndValidate<S extends z.ZodType>(

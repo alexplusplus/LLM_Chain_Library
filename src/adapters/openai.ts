@@ -18,10 +18,13 @@ export interface OpenAiClientLike {
       create(params: {
         model: string;
         messages: { role: "user"; content: string }[];
-        response_format: {
+        /** Sent in structured mode only; omitted entirely in plain-text mode. */
+        response_format?: {
           type: "json_schema";
           json_schema: { name: string; strict: true; schema: Record<string, unknown> };
         };
+        /** Sent only when the request carries a reasoning effort. */
+        reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
       }): Promise<{
         choices: { message?: { content?: string | null | undefined } | undefined }[];
       }>;
@@ -36,7 +39,12 @@ export interface OpenAiAdapterOptions {
 }
 
 /**
- * Adapter for the OpenAI API, using strict `json_schema` response format.
+ * Adapter for the OpenAI API, using strict `json_schema` response format in
+ * structured mode and no enforcement field in plain-text mode.
+ *
+ * Reasoning effort is a native 1:1 pass-through of `reasoning_effort` — all
+ * five dictionary values, no clamping (verified against openai@6, ADR 0003).
+ * Models that reject a value fail through the normal error classification.
  */
 export class OpenAiAdapter implements ProviderAdapter {
   readonly providerId = "openai";
@@ -54,7 +62,17 @@ export class OpenAiAdapter implements ProviderAdapter {
       response = await this.client.chat.completions.create({
         model: request.modelId,
         messages: [{ role: "user", content: request.prompt }],
-        response_format: toJsonSchemaResponseFormat(request.schema, request.schemaName),
+        ...(request.schema !== undefined
+          ? {
+              response_format: toJsonSchemaResponseFormat(
+                request.schema,
+                request.schemaName ?? "response",
+              ),
+            }
+          : {}),
+        ...(request.reasoningEffort !== undefined
+          ? { reasoning_effort: request.reasoningEffort }
+          : {}),
       });
     } catch (error) {
       throw classifyOpenAiError(error);

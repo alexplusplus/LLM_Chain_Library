@@ -63,6 +63,47 @@ describe("GeminiAdapter", () => {
     });
   });
 
+  it("sends no thinkingConfig when reasoningEffort is omitted (v0.1.1 parity)", async () => {
+    let sent: GenerateParams | undefined;
+    const adapter = new GeminiAdapter({ client: clientReturning('{"text":"ok"}', (p) => (sent = p)) });
+
+    await adapter.generate(request);
+
+    expect(Object.keys(sent?.config ?? {})).toEqual(["responseMimeType", "responseSchema"]);
+  });
+
+  it("omits responseMimeType and responseSchema entirely in plain-text mode", async () => {
+    let sent: GenerateParams | undefined;
+    const adapter = new GeminiAdapter({ client: clientReturning("  free-form\n", (p) => (sent = p)) });
+
+    const raw = await adapter.generate({ modelId: "gemini-2.5-flash", prompt: "generate" });
+
+    expect(raw).toBe("  free-form\n");
+    expect(sent?.config).toEqual({});
+  });
+
+  it("treats an empty plain-text response as TransientError", async () => {
+    const adapter = new GeminiAdapter({ client: clientReturning("") });
+    await expect(
+      adapter.generate({ modelId: "gemini-2.5-flash", prompt: "generate" }),
+    ).rejects.toBeInstanceOf(TransientError);
+  });
+
+  it.each([
+    ["minimal", 0],
+    ["low", 1024],
+    ["medium", 8192],
+    ["high", 16384],
+    ["xhigh", 24576],
+  ] as const)("converts reasoningEffort %s to thinkingBudget %i", async (effort, budget) => {
+    let sent: GenerateParams | undefined;
+    const adapter = new GeminiAdapter({ client: clientReturning('{"text":"ok"}', (p) => (sent = p)) });
+
+    await adapter.generate({ ...request, reasoningEffort: effort });
+
+    expect(sent?.config.thinkingConfig).toEqual({ thinkingBudget: budget });
+  });
+
   it("classifies 429 as QuotaError and parses the retryDelay hint", async () => {
     const message =
       'got status: 429 . {"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"39s"}]}}';

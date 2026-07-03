@@ -19,10 +19,15 @@ export interface OpenRouterAdapterOptions {
 
 /**
  * Adapter for OpenRouter's OpenAI-compatible endpoint, at the HTTP level
- * (no SDK), using `response_format: json_schema`.
+ * (no SDK), using `response_format: json_schema` in structured mode and no
+ * enforcement field in plain-text mode.
  *
- * Note (ADR 0002): only schema-capable models qualify as Chain Entries;
- * most `:free` variants do not enforce `json_schema` and are disqualified.
+ * Note (ADR 0002): only schema-capable models qualify as Chain Entries in
+ * structured chains; most `:free` variants do not enforce `json_schema` and
+ * are disqualified there — but they are eligible in plain-text chains.
+ *
+ * Reasoning effort is a native pass-through (`reasoning: { effort }`);
+ * OpenRouter normalizes it for the underlying model (ADR 0003).
  */
 export class OpenRouterAdapter implements ProviderAdapter {
   readonly providerId = "openrouter";
@@ -51,7 +56,17 @@ export class OpenRouterAdapter implements ProviderAdapter {
         body: JSON.stringify({
           model: request.modelId,
           messages: [{ role: "user", content: request.prompt }],
-          response_format: toJsonSchemaResponseFormat(request.schema, request.schemaName),
+          ...(request.schema !== undefined
+            ? {
+                response_format: toJsonSchemaResponseFormat(
+                  request.schema,
+                  request.schemaName ?? "response",
+                ),
+              }
+            : {}),
+          ...(request.reasoningEffort !== undefined
+            ? { reasoning: { effort: request.reasoningEffort } }
+            : {}),
         }),
       });
     } catch (error) {

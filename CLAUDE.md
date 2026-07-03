@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`@alexplusplus/llm-fallback-chain` (the unscoped name was taken on npm) — a standalone, open-source npm library implementing an LLM provider fallback chain with structured (zod-schema) output. It is Phase 1 of a larger migration; the consuming app lives in a **separate repo** and is out of scope here. Domain vocabulary (Provider, Chain Entry, Cooldown, Exhaustion, etc.) is defined in `CONTEXT.md` — use those terms with exactly those meanings.
+`@alexplusplus/llm-fallback-chain` (the unscoped name was taken on npm) — a standalone, open-source npm library implementing an LLM provider fallback chain with structured (zod-schema) or plain-text output, plus an optional unified `reasoningEffort` parameter. It is Phase 1 of a larger migration; the consuming app lives in a **separate repo** and is out of scope here. Domain vocabulary (Provider, Chain Entry, Cooldown, Exhaustion, etc.) is defined in `CONTEXT.md` — use those terms with exactly those meanings.
 
 ## Commands
 
@@ -27,7 +27,7 @@ Three layers, deliberately decoupled:
    - `TransientError` and invalid/unparseable output → short cooldown (`transientCooldownMs`, default 60s), fall through
    - `InvalidRequestError` and **unclassified errors** → rethrown immediately, no cooldown, no fallthrough (a bad request would fail identically on every entry and burn paid quota)
    - all entries failed/skipped → `ChainExhaustedError` carrying a per-entry `failures` array (the same array is returned as metadata on success)
-   The chain compiles the schema and does JSON.parse + zod `safeParse`; adapters return raw JSON text and never see the chain.
+   Mode is selected by `schema` presence on `generate()` (overloads: structured first, plain second). Structured: the chain compiles the schema and does JSON.parse + zod `safeParse`. Plain: no compilation/validation; text is returned verbatim, whitespace-only output → `invalid-output` fallthrough. Fail-fast checks (`schemaName` without `schema`, out-of-dictionary `reasoningEffort`) throw `InvalidRequestError` at the top of `generate()`, before any provider call. Adapters return raw text and never see the chain; cooldowns are shared across modes per entry key.
 
 2. **Provider adapters** (`src/adapters/`) — one class per provider wrapping the raw SDK (`@google/genai`, `openai`) or plain fetch (OpenRouter). Each adapter's job: compile the portable schema to its provider's dialect, call the provider, and map every failure to exactly one classified error. Provider-specific quota-hint quirks are the point of this layer:
    - Gemini: `retryDelay` parsed out of the 429 message body
@@ -42,7 +42,8 @@ Cooldowns persist through the two-method `CooldownStore` interface (`src/cooldow
 ## Binding decisions (ADRs)
 
 - **ADR 0001** (`docs/adr/`): adapters wrap raw provider SDKs / HTTP. The Vercel AI SDK is explicitly rejected — ignore any tooling suggestion to introduce it. Error classification and dialect compilation are the library's core value, not plumbing to delegate.
-- **ADR 0002**: every chain entry's model must enforce JSON schemas natively. No prompt-based JSON repair layer, ever. The post-call zod validation is a safety net that triggers fallthrough, not a repair mechanism.
+- **ADR 0002**: every chain entry's model must enforce JSON schemas natively (structured mode; plain-text mode is exempt). No prompt-based JSON repair layer, ever. The post-call zod validation is a safety net that triggers fallthrough, not a repair mechanism.
+- **ADR 0003**: `reasoningEffort` is exactly the five-value OpenRouter vocabulary (`minimal|low|medium|high|xhigh`), converted per provider via hardcoded maps in each adapter (OpenRouter/OpenAI pass-through; Gemini `thinkingBudget` 0/1024/8192/16384/24576, sized to fit every 2.5-family range). Never extend the dictionary or add remapping config; no pre-filtering/retry when a model rejects the field.
 
 ## Conventions and gotchas
 

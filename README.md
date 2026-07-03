@@ -1,13 +1,15 @@
 # @alexplusplus/llm-fallback-chain
 
-Structured LLM output through a configurable provider **fallback chain**:
-free tiers first, a paid floor last, with pluggable cooldown storage.
+Structured or plain-text LLM output through a configurable provider
+**fallback chain**: free tiers first, a paid floor last, with pluggable
+cooldown storage.
 
-Pass a prompt and a [zod](https://zod.dev) schema; the chain walks your
-entries top-down and returns parsed, TypeScript-typed data — or a classified
-error. Quota-exhausted or flaky entries go on **cooldown** and are skipped
-until they recover, so a free tier running dry falls through to the next
-entry instead of failing your request.
+Pass a prompt and a [zod](https://zod.dev) schema for parsed,
+TypeScript-typed data — or just a prompt for free-form text; the chain walks
+your entries top-down and returns the result with serving-entry metadata, or
+a classified error. Quota-exhausted or flaky entries go on **cooldown** and
+are skipped until they recover, so a free tier running dry falls through to
+the next entry instead of failing your request.
 
 ```
 Gemini (free) ──quota──▶ OpenRouter (cheap) ──5xx──▶ OpenAI (floor) ──▶ ✓ typed data
@@ -77,25 +79,90 @@ console.log(`served by ${entry.key} (${entry.providerId}/${entry.modelId})`);
 Log `entry` on every request: it tells you which chain position served it,
 which is how you notice free-tier utilization dropping (cost drift) early.
 
+## Plain-text quickstart
+
+Omit `schema` and the same chain generates free-form text — full fallback and
+cooldown machinery, no JSON parsing or validation:
+
+```ts
+const { text, entry, failures } = await chain.generate({
+  prompt: "Explain the difference between 'bank' and 'shore' in one paragraph.",
+});
+
+text; // string — the response verbatim (not trimmed)
+```
+
+The portable schema subset and the native-schema-enforcement requirement
+([ADR 0002](docs/adr/0002-native-schema-only.md)) apply to **structured mode
+only**. In plain-text mode, chain entries don't need schema-capable models —
+OpenRouter `:free` variants that are disqualified for structured use are
+eligible in plain-text chains.
+
+A whitespace-only response is treated like failed schema validation:
+short cooldown, fall through to the next entry (`reason: "invalid-output"`
+in `failures`).
+
+## Reasoning effort
+
+Both modes accept an optional `reasoningEffort` — one provider-agnostic value
+(OpenRouter's effort vocabulary) that each adapter converts to its provider's
+dialect via a hardcoded correspondence
+([ADR 0003](docs/adr/0003-unified-reasoning-effort.md)):
+
+```ts
+import { REASONING_EFFORTS, type ReasoningEffort } from "@alexplusplus/llm-fallback-chain";
+
+await chain.generate({ prompt, reasoningEffort: "low" });
+```
+
+| `reasoningEffort` | OpenRouter `reasoning.effort` | OpenAI `reasoning_effort` | Gemini `thinkingConfig.thinkingBudget` |
+| --- | --- | --- | --- |
+| `minimal` | `minimal` | `minimal` | `0` |
+| `low` | `low` | `low` | `1024` |
+| `medium` | `medium` | `medium` | `8192` |
+| `high` | `high` | `high` | `16384` |
+| `xhigh` | `xhigh` | `xhigh` | `24576` |
+
+- Omitted → no reasoning-related field is sent to any provider at all.
+- A value outside the dictionary (possible from untyped callers or config
+  strings — validate yours against the exported `REASONING_EFFORTS` array)
+  throws `InvalidRequestError` before any provider is called.
+- The conversion is deterministic from the effort value and the serving
+  `entry.providerId`, so you can persist "effort actually sent" from the
+  metadata you already log — no extra result fields.
+- Gemini budgets are sized to fit every 2.5-family model range (Flash caps
+  at 24576), so one request-level value survives every entry it walks.
+
+> **⚠️ A model that rejects the reasoning field aborts the whole call.**
+> The chain does not pre-filter or retry without the field: a provider
+> rejection classifies as `InvalidRequestError`, which fails the entire call
+> immediately — **no fallthrough to later entries**. Known case: Gemini
+> models that cannot disable thinking (e.g. 2.5 Pro, floor 128) reject
+> `minimal` (budget `0`). Choosing reasoning-capable models for every entry
+> of a chain that receives `reasoningEffort` is your responsibility.
+
 ## How the chain walks
 
 For each entry, top-down:
 
 | Outcome | Classification | Effect |
 | --- | --- | --- |
-| Success | — | Response validated against your zod schema, returned with serving-entry metadata |
+| Success | — | Structured: response validated against your zod schema. Plain: text returned verbatim. Both carry serving-entry metadata |
 | Quota exhausted (429/402) | `QuotaError` | Long cooldown — provider's retry hint, else next UTC midnight — then falls through |
 | Transient failure (5xx, timeout, network) | `TransientError` | Short cooldown (default 60 s), falls through |
-| Output fails JSON/schema validation | — | Treated like transient: short cooldown, falls through |
+| Output fails JSON/schema validation (structured) or is whitespace-only (plain) | — | Treated like transient: short cooldown, falls through |
 | Bad request (4xx: schema, prompt, API key) | `InvalidRequestError` | **Whole call fails immediately.** No cooldown, no fallthrough — the same bug would fail on every entry, silently burning paid quota |
 | Every entry skipped/failed | `ChainExhaustedError` | Carries a per-entry failure list for diagnostics |
 
-Entries already on cooldown are skipped without a provider call.
+Entries already on cooldown are skipped without a provider call. Cooldowns
+are keyed by chain entry and shared across both output modes on the same
+chain instance — they represent provider/model quota state, which is
+mode-independent.
 
-## The portable schema subset
+## The portable schema subset (structured mode)
 
-All entries must be able to enforce your schema natively (see
-[ADR 0002](docs/adr/0002-native-schema-only.md)), so schemas are limited to
+In structured mode, all entries must be able to enforce your schema natively
+(see [ADR 0002](docs/adr/0002-native-schema-only.md)), so schemas are limited to
 the intersection of the Gemini `responseSchema`, OpenAI strict `json_schema`,
 and OpenRouter `response_format` dialects:
 
@@ -314,10 +381,17 @@ class MyAdapter implements ProviderAdapter {
   readonly providerId = "my-provider";
 
   async generate(request: AdapterRequest): Promise<string> {
-    // 1. Compile request.schema (portable form) to your provider's dialect.
-    // 2. Call the provider with request.modelId and request.prompt.
-    // 3. Return the raw JSON text — the chain parses and validates it.
-    // 4. Map every failure to QuotaError (with a retryAt hint when the
+    // 1. If request.schema is present (structured mode), compile it (portable
+    //    form) to your provider's dialect; request.schemaName is set alongside
+    //    it. If absent (plain-text mode), omit your provider's
+    //    schema-enforcement field from the request entirely.
+    // 2. If request.reasoningEffort is present, convert it to your provider's
+    //    dialect (hardcoded map, see ADR 0003); if absent, send no
+    //    reasoning-related field. The chain has already validated the value.
+    // 3. Call the provider with request.modelId and request.prompt.
+    // 4. Return the raw response text — in structured mode the chain parses
+    //    and validates it; in plain mode it is returned verbatim.
+    // 5. Map every failure to QuotaError (with a retryAt hint when the
     //    provider gives one), TransientError, or InvalidRequestError.
   }
 }
@@ -325,6 +399,11 @@ class MyAdapter implements ProviderAdapter {
 
 Adapters never see the chain: ordering, cooldowns, and fallthrough live
 entirely in the chain walker.
+
+> Since v0.2.0, `request.schema` / `request.schemaName` are optional
+> (absent = plain-text mode) and `request.reasoningEffort` was added. Custom
+> adapters written against v0.1.x assumed `schema` was always present —
+> handle its absence when upgrading.
 
 ## Configuration reference
 

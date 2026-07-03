@@ -1,3 +1,4 @@
+import type { ReasoningEffort } from "./effort.js";
 import type { PortableSchema } from "./schema/portable.js";
 
 /**
@@ -19,10 +20,21 @@ export interface AdapterRequest {
   /**
    * The request's schema, already compiled to the portable subset.
    * The adapter transforms it to its provider's native dialect.
+   * Absent = plain-text mode: the adapter must omit its provider's
+   * schema-enforcement field from the request entirely.
    */
-  schema: PortableSchema;
-  /** Name for dialects that require a named schema (OpenAI/OpenRouter `json_schema`). */
-  schemaName: string;
+  schema?: PortableSchema;
+  /**
+   * Name for dialects that require a named schema (OpenAI/OpenRouter
+   * `json_schema`). Present iff `schema` is present.
+   */
+  schemaName?: string;
+  /**
+   * Unified reasoning effort, already validated by the chain. The adapter
+   * converts it to its provider's dialect (hardcoded correspondence,
+   * ADR 0003); absent = no reasoning-related field is sent.
+   */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /**
@@ -37,7 +49,10 @@ export interface AdapterRequest {
  */
 export interface ProviderAdapter {
   readonly providerId: string;
-  /** @returns the provider's raw response text (expected to be JSON). */
+  /**
+   * @returns the provider's raw response text (expected to be JSON when
+   * `request.schema` is present, free-form text otherwise).
+   */
   generate(request: AdapterRequest): Promise<string>;
 }
 

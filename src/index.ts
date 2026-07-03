@@ -6,7 +6,12 @@ export {
   type FallbackChainConfig,
   type GenerateRequest,
   type GenerateResult,
+  type PlainGenerateRequest,
+  type PlainGenerateResult,
 } from "./chain.js";
+
+// Reasoning effort (unified dictionary, ADR 0003)
+export { REASONING_EFFORTS, type ReasoningEffort } from "./effort.js";
 
 // Contracts
 export type {

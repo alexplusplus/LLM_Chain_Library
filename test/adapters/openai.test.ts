@@ -69,14 +69,55 @@ describe("OpenAiAdapter", () => {
     expect(raw).toBe('{"text":"ok"}');
     expect(sent?.model).toBe("gpt-4o-mini");
     expect(sent?.messages).toEqual([{ role: "user", content: "generate" }]);
-    expect(sent?.response_format.type).toBe("json_schema");
-    expect(sent?.response_format.json_schema.name).toBe("my_schema");
-    expect(sent?.response_format.json_schema.strict).toBe(true);
-    expect(sent?.response_format.json_schema.schema).toMatchObject({
+    expect(sent?.response_format?.type).toBe("json_schema");
+    expect(sent?.response_format?.json_schema.name).toBe("my_schema");
+    expect(sent?.response_format?.json_schema.strict).toBe(true);
+    expect(sent?.response_format?.json_schema.schema).toMatchObject({
       type: "object",
       additionalProperties: false,
       required: ["text"],
     });
+  });
+
+  it("sends no reasoning field at all when reasoningEffort is omitted (v0.1.1 parity)", async () => {
+    let sent: CreateParams | undefined;
+    const adapter = new OpenAiAdapter({ client: clientReturning('{"text":"ok"}', (p) => (sent = p)) });
+
+    await adapter.generate(request);
+
+    expect(Object.keys(sent ?? {})).toEqual(["model", "messages", "response_format"]);
+  });
+
+  it("omits response_format entirely in plain-text mode and returns the text verbatim", async () => {
+    let sent: CreateParams | undefined;
+    const adapter = new OpenAiAdapter({ client: clientReturning("  free-form\n", (p) => (sent = p)) });
+
+    const raw = await adapter.generate({ modelId: "gpt-4o-mini", prompt: "generate" });
+
+    expect(raw).toBe("  free-form\n");
+    expect(Object.keys(sent ?? {})).toEqual(["model", "messages"]);
+  });
+
+  it("treats an empty plain-text completion as TransientError", async () => {
+    const adapter = new OpenAiAdapter({ client: clientReturning("") });
+    await expect(
+      adapter.generate({ modelId: "gpt-4o-mini", prompt: "generate" }),
+    ).rejects.toBeInstanceOf(TransientError);
+  });
+
+  it.each([
+    ["minimal", "minimal"],
+    ["low", "low"],
+    ["medium", "medium"],
+    ["high", "high"],
+    ["xhigh", "xhigh"],
+  ] as const)("passes reasoningEffort %s through natively as reasoning_effort", async (effort, expected) => {
+    let sent: CreateParams | undefined;
+    const adapter = new OpenAiAdapter({ client: clientReturning('{"text":"ok"}', (p) => (sent = p)) });
+
+    await adapter.generate({ ...request, reasoningEffort: effort });
+
+    expect(sent?.reasoning_effort).toBe(expected);
   });
 
   it("classifies 429 as QuotaError and honors a retry-after header", async () => {

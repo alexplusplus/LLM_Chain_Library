@@ -5,8 +5,25 @@ import {
   QuotaError,
   TransientError,
 } from "../errors.js";
+import type { ReasoningEffort } from "../effort.js";
 import { toGeminiSchema } from "../schema/dialects.js";
 import type { AdapterRequest, ProviderAdapter } from "../types.js";
+
+/**
+ * Unified effort → Gemini `thinkingConfig.thinkingBudget` (tokens). Effort is
+ * per-request while Chain Entries are fixed, so one value must survive every
+ * entry it walks: budgets are sized to fit within every Gemini 2.5-family
+ * model range (Flash caps at 24576). `0` disables thinking — models that
+ * can't disable it (2.5 Pro, floor 128) reject it; see the README caveat.
+ * Ranges: https://ai.google.dev/gemini-api/docs/thinking#set-budget
+ */
+const THINKING_BUDGETS: Record<ReasoningEffort, number> = {
+  minimal: 0,
+  low: 1024,
+  medium: 8192,
+  high: 16384,
+  xhigh: 24576,
+};
 
 /**
  * Structural slice of the `@google/genai` client the adapter actually uses.
@@ -18,8 +35,11 @@ export interface GeminiClientLike {
       model: string;
       contents: string;
       config: {
-        responseMimeType: string;
-        responseSchema: Record<string, unknown>;
+        /** Sent in structured mode only; omitted entirely in plain-text mode. */
+        responseMimeType?: string;
+        responseSchema?: Record<string, unknown>;
+        /** Sent only when the request carries a reasoning effort. */
+        thinkingConfig?: { thinkingBudget: number };
       };
     }): Promise<{ text?: string | undefined }>;
   };
@@ -33,7 +53,11 @@ export interface GeminiAdapterOptions {
 
 /**
  * Adapter for the Gemini API (`@google/genai` SDK), using native
- * `responseSchema` JSON enforcement.
+ * `responseSchema` JSON enforcement in structured mode and no enforcement
+ * config in plain-text mode.
+ *
+ * Reasoning effort maps to a hardcoded `thinkingBudget` (ADR 0003); see
+ * {@link THINKING_BUDGETS} for the correspondence and its sizing rationale.
  */
 export class GeminiAdapter implements ProviderAdapter {
   readonly providerId = "gemini";
@@ -52,8 +76,15 @@ export class GeminiAdapter implements ProviderAdapter {
         model: request.modelId,
         contents: request.prompt,
         config: {
-          responseMimeType: "application/json",
-          responseSchema: toGeminiSchema(request.schema),
+          ...(request.schema !== undefined
+            ? {
+                responseMimeType: "application/json",
+                responseSchema: toGeminiSchema(request.schema),
+              }
+            : {}),
+          ...(request.reasoningEffort !== undefined
+            ? { thinkingConfig: { thinkingBudget: THINKING_BUDGETS[request.reasoningEffort] } }
+            : {}),
         },
       });
     } catch (error) {
