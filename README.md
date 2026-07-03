@@ -24,6 +24,9 @@ npm install @alexplusplus/llm-fallback-chain zod
 
 `zod` (v4) is a peer dependency.
 
+The package is ESM. From CommonJS projects, `require()` works on Node ≥ 20.19
+/ ≥ 22.12 (native `require(esm)`); on older Node use dynamic `import()`.
+
 ## Quickstart
 
 ```ts
@@ -124,17 +127,177 @@ processes. On serverless hosts, inject a durable store so a quota discovery
 on one instance benefits all instances:
 
 ```ts
-createFallbackChain({ entries, cooldownStore: new MyFirestoreCooldownStore(db) });
+createFallbackChain({ entries, cooldownStore: new FirestoreCooldownStore(db) });
 ```
 
+### Entry keys are arbitrary strings — encode them
+
+Chain Entry keys routinely contain `/`, `:` and `.` (e.g. an OpenRouter entry
+keyed `openrouter:meta-llama/llama-3.3-70b-instruct`). Many document stores
+forbid these characters in document IDs or treat `/` as a path separator, so
+a store that uses the raw key as an ID will fail — or worse, fail silently —
+in production. Encode the key when deriving the ID. A minimal Firestore
+implementation:
+
+```ts
+import type { CooldownStore } from "@alexplusplus/llm-fallback-chain";
+import type { Firestore } from "firebase-admin/firestore";
+
+export class FirestoreCooldownStore implements CooldownStore {
+  constructor(
+    private readonly db: Firestore,
+    private readonly collection = "llmCooldowns",
+  ) {}
+
+  // Firestore doc IDs cannot contain "/" — encode the entry key.
+  private doc(entryKey: string) {
+    return this.db.collection(this.collection).doc(encodeURIComponent(entryKey));
+  }
+
+  async mark(entryKey: string, retryAt: Date): Promise<void> {
+    await this.doc(entryKey).set({ retryAt });
+  }
+
+  async check(entryKey: string): Promise<Date | null> {
+    const snap = await this.doc(entryKey).get();
+    if (!snap.exists) return null;
+    const retryAt: Date = snap.get("retryAt").toDate();
+    if (retryAt.getTime() <= Date.now()) {
+      await this.doc(entryKey).delete(); // prune expired cooldowns
+      return null;
+    }
+    return retryAt;
+  }
+}
+```
+
+### Verifying a store implementation
+
 Verify any implementation against the behavioral contract (framework-agnostic,
-works in any test runner):
+works in any test runner). Since v0.1.1 the contract includes a
+slash-containing key, so it catches the document-ID class of bug above:
 
 ```ts
 import { verifyCooldownStoreContract } from "@alexplusplus/llm-fallback-chain";
 
-await verifyCooldownStoreContract(() => new MyFirestoreCooldownStore(db));
+await verifyCooldownStoreContract(() => new FirestoreCooldownStore(db));
 ```
+
+**Persistent stores need a throwaway collection per run.** The contract suite
+uses fixed key names, so state left behind by a previous run violates the
+"unmarked key returns `null`" assertion. Point each run at a fresh,
+disposable collection (and delete it afterwards, or let a TTL policy expire
+it):
+
+```ts
+const collection = `cooldown-contract-${Date.now()}`;
+await verifyCooldownStoreContract(() => new FirestoreCooldownStore(db, collection));
+```
+
+The factory is called several times per run; sharing one throwaway collection
+across those instances is fine — the contract's key names don't collide with
+each other, only with earlier runs.
+
+## Deploying on Netlify: environment variables
+
+A typical serverless deployment (the setup this section describes was proven
+on Netlify with a Nuxt/Nitro app) needs two groups of environment variables:
+provider API keys for the chain, and Firebase service-account credentials for
+a Firestore-backed cooldown store. All of them are **server-side secrets** —
+none may ever be exposed to the client bundle (no `NUXT_PUBLIC_` / `VITE_` /
+`NEXT_PUBLIC_` prefixes).
+
+### 1. Provider API keys
+
+One per provider that appears in your chain:
+
+| Variable | Used by | Where to get it |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | `GeminiAdapter` | [Google AI Studio](https://aistudio.google.com/apikey) |
+| `OPENROUTER_API_KEY` | `OpenRouterAdapter` | [OpenRouter → Keys](https://openrouter.ai/keys) |
+| `OPENAI_API_KEY` | `OpenAiAdapter` | [OpenAI platform → API keys](https://platform.openai.com/api-keys) |
+
+Consider skipping chain entries whose key is missing (with a startup warning)
+instead of failing: the app then keeps working on whatever providers are
+configured, and a partially configured preview deploy still serves requests.
+
+### 2. Firebase credentials for the cooldown store
+
+Netlify functions have no Google Cloud identity, so firebase-admin's
+`applicationDefault()` cannot work there — you must pass an explicit service
+account:
+
+1. In the [Firebase console](https://console.firebase.google.com/), open your
+   project → ⚙ **Project settings** → **Service accounts** → **Generate new
+   private key**. This downloads a JSON file.
+2. From that JSON you need three values: `project_id`, `client_email`, and
+   `private_key`. Do **not** commit the file or ship it in the repo.
+3. Set them as `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, and
+   `FIREBASE_PRIVATE_KEY`.
+
+**The private-key newline gotcha.** `private_key` is a multi-line PEM block.
+Depending on how you set the variable (UI paste vs. CLI vs. copying the JSON
+value with its `\n` escape sequences intact), the value that reaches your
+function may contain literal backslash-n instead of real newlines — and
+firebase-admin then fails with `Invalid PEM formatted message`. Normalize in
+code; the `replace` is a no-op when the newlines are already real:
+
+```ts
+import { cert, getApps, initializeApp } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
+
+// A named app avoids colliding with any firebase-admin app your framework
+// integration (e.g. nuxt-vuefire) registers in the same process.
+const APP_NAME = "llm-chain";
+
+export function getAdminFirestore() {
+  const existing = getApps().find((a) => a.name === APP_NAME);
+  const app =
+    existing ??
+    initializeApp(
+      {
+        credential: cert({
+          projectId: process.env.FIREBASE_PROJECT_ID!,
+          clientEmail: process.env.FIREBASE_CLIENT_EMAIL!,
+          privateKey: process.env.FIREBASE_PRIVATE_KEY!.replace(/\\n/g, "\n"),
+        }),
+      },
+      APP_NAME,
+    );
+  return getFirestore(app);
+}
+```
+
+### 3. Setting the variables in Netlify
+
+- **UI:** Project configuration → **Environment variables** → *Add a
+  variable*. Paste the PEM value as-is (the multi-line textarea preserves
+  newlines). Mark each of these as **secret** so they're masked in logs and
+  the UI, and restrict the scope to **Functions** — neither the build nor
+  post-processing needs provider keys or Firebase credentials.
+- **CLI:** `netlify env:set GEMINI_API_KEY "…" --secret`. For the private
+  key it's usually easier to paste the JSON's `private_key` string (with its
+  `\n` escapes) and rely on the `replace()` above.
+- Environment variables are baked into functions **at deploy time** — after
+  adding or changing one, trigger a redeploy or it won't be picked up.
+- **Size limit:** Netlify functions run on AWS Lambda, which caps the total
+  environment at 4 KB. A Firebase private key alone is ~1.7 KB, so keep
+  unrelated variables scoped away from Functions if you get close.
+- **Local dev:** `netlify dev` injects the same variables locally; without
+  it, put the values in your framework's `.env` (git-ignored).
+
+### 4. Wire it together
+
+```ts
+const chain = createFallbackChain({
+  entries,
+  cooldownStore: new FirestoreCooldownStore(getAdminFirestore()),
+});
+```
+
+Consider wrapping the store fail-open (catch and log store errors, treat
+`check` as "not on cooldown") so Firestore trouble can degrade cooldown
+persistence instead of blocking generation.
 
 ## Writing an adapter
 

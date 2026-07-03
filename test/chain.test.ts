@@ -65,7 +65,9 @@ describe("createFallbackChain", () => {
     const retryAt = new Date("2026-07-02T18:30:00Z");
     const first = failingWith("gemini", new QuotaError("exhausted", { retryAt }));
     const second = succeeding("openai");
-    const store = new InMemoryCooldownStore();
+    // Same clock for chain and store, or real-time pruning expires the
+    // cooldown as soon as the wall clock passes the frozen test dates.
+    const store = new InMemoryCooldownStore({ now: fixedNow });
     const chain = createFallbackChain({
       entries: [
         { key: "free", adapter: first, modelId: "m1" },
@@ -87,7 +89,7 @@ describe("createFallbackChain", () => {
   it("defaults the quota cooldown to next UTC midnight when the provider gives no hint", async () => {
     const first = failingWith("gemini", new QuotaError("exhausted"));
     const second = succeeding("openai");
-    const store = new InMemoryCooldownStore();
+    const store = new InMemoryCooldownStore({ now: fixedNow });
     const chain = createFallbackChain({
       entries: [
         { key: "free", adapter: first, modelId: "m1" },
@@ -133,6 +135,7 @@ describe("createFallbackChain", () => {
         { key: "free", adapter: first, modelId: "m1" },
         { key: "paid", adapter: second, modelId: "m2" },
       ],
+      cooldownStore: new InMemoryCooldownStore({ now: fixedNow }),
       now: fixedNow,
     });
 

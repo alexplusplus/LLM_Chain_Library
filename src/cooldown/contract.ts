@@ -70,6 +70,26 @@ export async function verifyCooldownStoreContract(
     const a = await store.check("contract-key-a");
     assert(a !== null, `marking one key must not be lost when another key is checked`);
   }
+
+  {
+    // Real Chain Entry keys contain characters that many document stores
+    // forbid in IDs/paths: "/" in OpenRouter model ids, ":" in provider
+    // prefixes, "." in version suffixes. Stores that derive document IDs
+    // from the key must encode it, not fail or split it into a path.
+    const store = await factory();
+    const slashKey = "contract-openrouter:meta-llama/llama-3.3-70b-instruct";
+    await store.mark(slashKey, farFuture);
+    const found = await store.check(slashKey);
+    assert(
+      found !== null && found.getTime() === farFuture.getTime(),
+      `a key containing "/", ":" and "." (${JSON.stringify(slashKey)}) must round-trip like any other key, got ${fmt(found)}`,
+    );
+    const sibling = await store.check("contract-openrouter:meta-llama/llama-3.1-8b-instruct");
+    assert(
+      sibling === null,
+      `keys sharing a "/" prefix segment must stay independent, got ${fmt(sibling)}`,
+    );
+  }
 }
 
 function assert(condition: boolean, message: string): asserts condition {
